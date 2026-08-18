@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Spider Walker",
     "author": "iltaen",
-    "version": (1, 0, 0),
+    "version": (1, 0, 2),
     "blender": (5, 2, 0),
     "location": "Properties > Armature Data > Spider Walker",
     "description": (
@@ -192,45 +192,16 @@ class SpiderWalkerSettings(PropertyGroup):
     # User-facing prediction control
     # --------------------------------------------------------
 
-    prediction: FloatProperty(
-        name="Prediction",
-        description="How strongly the legs anticipate body movement at higher speed",
-        default=1.00,
+    prediction_distance: FloatProperty(
+        name="Prediction Distance",
+        description=(
+            "How far ahead of the body, in the direction of travel, a leg "
+            "is placed at high speed. 0 disables prediction (legs only "
+            "follow the body's current position)"
+        ),
+        default=2.00,
         min=0.0,
-        max=10.0,
-    )
-
-    # Internal prediction defaults. These are intentionally hidden from the UI.
-    prediction_time: FloatProperty(
-        name="Prediction Time",
-        default=0.18,
-        min=0.0,
-        max=3.0,
-        options={'HIDDEN'},
-    )
-
-    prediction_strength: FloatProperty(
-        name="Prediction Strength",
-        default=1.00,
-        min=0.0,
-        max=5.0,
-        options={'HIDDEN'},
-    )
-
-    max_prediction: FloatProperty(
-        name="Max Prediction",
-        default=10.00,
-        min=0.0,
-        max=20.0,
-        options={'HIDDEN'},
-    )
-
-    speed_prediction_factor: FloatProperty(
-        name="Speed Prediction Factor",
-        default=1.00,
-        min=0.0,
-        max=5.0,
-        options={'HIDDEN'},
+        soft_max=10.0,
     )
 
     speed_step_scale: FloatProperty(
@@ -383,8 +354,8 @@ def validate_step_settings(settings):
             "Max Step Time must be greater than or equal to Min Step Time"
         )
 
-    if settings.prediction < 0.0:
-        raise RuntimeError("Prediction cannot be negative")
+    if settings.prediction_distance < 0.0:
+        raise RuntimeError("Prediction Distance cannot be negative")
 
     if settings.speed_step_scale < 0.0:
         raise RuntimeError("Internal speed step scale cannot be negative")
@@ -1069,7 +1040,16 @@ def get_predicted_target(
     velocity,
     settings
 ):
-    """Calculate prediction with low-speed suppression and high-speed growth."""
+    """Shift a leg's rest target ahead of the body in its direction of
+    travel, so legs land in front of the body instead of trailing it.
+
+    Model: by the time the upcoming step finishes, the body will have
+    moved roughly `speed * step_duration` further along its current
+    direction of travel. The target is shifted that far ahead so the leg
+    is still under (or ahead of) the body when the step completes, capped
+    at `settings.prediction_distance` -- the single user-facing control
+    for how far forward legs reach at high speed.
+    """
 
     body_matrix = get_world_matrix(
         armature,
@@ -1080,7 +1060,7 @@ def get_predicted_target(
         body_matrix.translation.copy()
     )
 
-    target = (
+    rest_target = (
         body_position
         +
         body_matrix.to_3x3()
@@ -1088,120 +1068,45 @@ def get_predicted_target(
         offset
     )
 
+    if settings.prediction_distance <= 0.0:
+        return rest_target
+
     speed = velocity.length
 
-    if (
-        speed <= 1e-6
-        or
-        settings.prediction <= 0.0
-    ):
-        return target
+    if speed <= 1e-6:
+        return rest_target
 
-    # Use normal step speed as the reference point for the prediction curve.
-    reference_speed = max(
-        settings.step_speed,
-        0.01
-    )
+    direction = velocity / speed
 
-    speed_ratio = (
-        speed / reference_speed
-    )
-
-    # Keep prediction almost inactive at low speed.
-    # A smooth ramp removes the unwanted forward bias during slow motion.
-    low_speed_start = 0.20
-    ramp_width = 0.80
-
-    ramp = (
-        speed_ratio - low_speed_start
-    ) / ramp_width
-
-    ramp = max(
-        0.0,
-        min(
-            1.0,
-            ramp
-        )
-    )
-
-    low_speed_gate = (
-        ramp
-        *
-        ramp
-        *
-        (3.0 - 2.0 * ramp)
-    )
-
-    # Above normal walking speed, continue increasing the response
-    # instead of flattening it at 1.0.
-    if speed_ratio > 1.0:
-        speed_response = (
-            low_speed_gate
-            +
-            (speed_ratio - 1.0) * 0.75
-        )
-    else:
-        speed_response = low_speed_gate
-
-    # Give the user-facing control a slightly nonlinear range so
-    # high values remain meaningfully stronger than low values.
-    prediction_gain = (
-        settings.prediction ** 1.15
-    )
-
-    estimated_distance = max(
-        settings.step_distance,
-        speed * settings.prediction_time
-    )
-
-    estimated_duration = calculate_step_duration(
-        estimated_distance,
+    # How far the body is expected to travel while this step is in the
+    # air. Reuses the same adaptive-distance and duration model the step
+    # system itself uses, so prediction stays consistent with actual
+    # step timing instead of following an unrelated separate curve.
+    estimated_step_distance = get_adaptive_step_distance(
+        velocity,
         settings
     )
 
-    speed_lead = (
-        velocity
-        *
-        estimated_duration
-        *
-        settings.speed_prediction_factor
+    estimated_duration = calculate_step_duration(
+        estimated_step_distance,
+        settings
     )
 
-    prediction = (
-        speed_lead
-        *
-        speed_response
-        *
-        prediction_gain
+    # Lead distance grows directly with body speed (already ~0 when the
+    # body is nearly still, since speed itself is ~0) and is capped by
+    # the single user-facing distance control. No separate speed-ratio
+    # gate here: an earlier version gated this against settings.step_speed
+    # as a stand-in "reference speed", but step_speed is a foot-swing rate,
+    # not the body's actual world-space speed, and a mismatch between the
+    # two units could hold the gate at zero and make Prediction Distance
+    # appear to do nothing no matter what it was set to.
+    lead_distance = min(
+        speed * estimated_duration,
+        settings.prediction_distance
     )
 
-    # Increase the internal safety limit together with the user control.
-    # This prevents high Prediction values from all collapsing into the
-    # same capped target at extreme speed.
-    effective_max_prediction = (
-        settings.max_prediction
-        *
-        max(
-            1.0,
-            1.0 + 0.5 * (settings.prediction - 1.0)
-        )
-    )
+    return rest_target + direction * lead_distance
 
-    if (
-        prediction.length
-        >
-        effective_max_prediction
-    ):
-
-        prediction = (
-            prediction.normalized()
-            *
-            effective_max_prediction
-        )
-
-    target += prediction
-
-    return target
 
 
 # ============================================================
@@ -1528,7 +1433,6 @@ def get_configuration_signature(
         else 0,
         round(settings.surface_probe_distance, 4),
         round(settings.surface_offset, 4),
-        round(settings.speed_prediction_factor, 4),
         round(settings.speed_step_scale, 4),
         round(settings.max_speed_step_distance, 4),
     )
@@ -2613,17 +2517,13 @@ class SPIDER_OT_reset_parameters(
         settings.step_distance = 1.00
         settings.step_speed = 10.00
         settings.step_height = 0.30
-        settings.prediction = 1.00
+        settings.prediction_distance = 2.00
 
         # Advanced step timing
         settings.min_step_time = 0.10
         settings.max_step_time = 0.50
 
-        # Advanced prediction
-        settings.prediction_time = 0.18
-        settings.prediction_strength = 1.00
-        settings.max_prediction = 10.00
-        settings.speed_prediction_factor = 1.00
+        # Advanced adaptive step distance
         settings.speed_step_scale = 0.35
         settings.max_speed_step_distance = 1.30
 
@@ -3563,8 +3463,8 @@ class SPIDER_PT_walker(
 
         box.prop(
             settings,
-            "prediction",
-            text="Prediction"
+            "prediction_distance",
+            text="Prediction Distance"
         )
 
         # ====================================================
@@ -3634,32 +3534,8 @@ class SPIDER_PT_walker(
             box.separator()
 
             box.label(
-                text="Prediction",
+                text="Adaptive Step Distance",
                 icon='FORWARD'
-            )
-
-            box.prop(
-                settings,
-                "prediction_time",
-                text="Prediction Time"
-            )
-
-            box.prop(
-                settings,
-                "prediction_strength",
-                text="Prediction Strength"
-            )
-
-            box.prop(
-                settings,
-                "max_prediction",
-                text="Max Prediction"
-            )
-
-            box.prop(
-                settings,
-                "speed_prediction_factor",
-                text="Speed Prediction Factor"
             )
 
             box.prop(
