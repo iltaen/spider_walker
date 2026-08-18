@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Spider Walker",
     "author": "iltaen",
-    "version": (1, 0, 2),
+    "version": (1, 0, 5),
     "blender": (5, 2, 0),
     "location": "Properties > Armature Data > Spider Walker",
     "description": (
@@ -207,7 +207,7 @@ class SpiderWalkerSettings(PropertyGroup):
     speed_step_scale: FloatProperty(
         name="Speed Step Scale",
         description="Allows step distance to increase with body speed",
-        default=0.35,
+        default=0.30,
         min=0.0,
         max=2.0,
         options={'HIDDEN'},
@@ -215,8 +215,12 @@ class SpiderWalkerSettings(PropertyGroup):
 
     max_speed_step_distance: FloatProperty(
         name="Max Speed Step Distance",
-        description="Maximum adaptive step distance at high speed",
-        default=1.30,
+        description=(
+            "Hard cap on how far a single step is allowed to reach. If "
+            "set below Step Distance, this cap wins and steps stay short "
+            "even at rest"
+        ),
+        default=0.50,
         min=0.05,
         max=10.0,
         options={'HIDDEN'},
@@ -360,12 +364,6 @@ def validate_step_settings(settings):
     if settings.speed_step_scale < 0.0:
         raise RuntimeError("Internal speed step scale cannot be negative")
 
-    # This is an internal adaptive-step limit and is hidden from the UI.
-    # Older saved scenes may contain a smaller legacy value, so normalize it
-    # automatically instead of showing an error the user cannot fix.
-    if settings.max_speed_step_distance < settings.step_distance:
-        settings.max_speed_step_distance = settings.step_distance
-
 
 def validate_collision_settings(settings):
     """Validate the optional collision collection without breaking the walker."""
@@ -383,7 +381,7 @@ def validate_collision_settings(settings):
 
     if mesh_count == 0:
         print(
-            f"[Spider Walker V7] Warning: collision collection '{collection.name}' "
+            f"[Spider Walker] Warning: collision collection '{collection.name}' "
             "contains no visible mesh objects; surface collision will be skipped."
         )
 
@@ -637,7 +635,7 @@ def raycast_surface(
         mesh_count = count_collision_meshes(collection)
 
         print(
-            f"[Spider Walker V7] Collision collection: "
+            f"[Spider Walker] Collision collection: "
             f"{collection.name} | visible meshes: {mesh_count}"
         )
 
@@ -729,7 +727,7 @@ def raycast_surface(
 
         except Exception as exc:
             print(
-                f"[Spider Walker V7] "
+                f"[Spider Walker] "
                 f"Raycast skipped for {obj.name}: {exc}"
             )
             continue
@@ -1078,13 +1076,20 @@ def get_predicted_target(
 
     direction = velocity / speed
 
-    # How far the body is expected to travel while this step is in the
-    # air. Reuses the same adaptive-distance and duration model the step
-    # system itself uses, so prediction stays consistent with actual
-    # step timing instead of following an unrelated separate curve.
-    estimated_step_distance = get_adaptive_step_distance(
-        velocity,
-        settings
+    # How long the body-driven part of a step of this size would take.
+    # Deliberately NOT using get_adaptive_step_distance() here: that
+    # function clamps its result to settings.max_speed_step_distance,
+    # which exists to cap how physically far a leg is allowed to reach
+    # for a single step (the step-trigger system). Feeding that clamped
+    # value into the duration estimate meant lowering
+    # max_speed_step_distance also throttled prediction indirectly,
+    # even though Prediction Distance was already set high -- the two
+    # controls were fighting each other. This uses an unclamped estimate
+    # so Prediction Distance is the only thing that caps how far ahead
+    # legs are placed.
+    estimated_step_distance = (
+        settings.step_distance
+        + speed * settings.speed_step_scale
     )
 
     estimated_duration = calculate_step_duration(
@@ -1111,8 +1116,6 @@ def get_predicted_target(
 
 # ============================================================
 # STEP DURATION
-# ============================================================
-
 # ============================================================
 
 def calculate_step_duration(
@@ -1675,7 +1678,7 @@ def _spider_timer_tick():
             runtime["configured"] = False
             runtime["configuration_error"] = str(exc)
             print(
-                f"[Spider Walker V7] Configuration error: {exc}"
+                f"[Spider Walker] Configuration error: {exc}"
             )
             success = False
 
@@ -1866,6 +1869,27 @@ def on_enabled_toggle(self, context):
 @bpy.app.handlers.persistent
 def _spider_walker_load_post(dummy):
     """Re-sync the timer whenever a .blend file is opened."""
+    sync_timer_with_settings()
+
+
+@bpy.app.handlers.persistent
+def _spider_walker_undo_post(dummy):
+    """Re-sync everything after an undo/redo step.
+
+    Blender's undo/redo restores property values directly at the RNA
+    level and does NOT call a property's update= callback. That means an
+    undo landing on the "Procedural Walk" checkbox (or on the internal
+    timer-token scene property) can silently desync our timer's
+    running/stopped state from what the UI now shows, with no exception
+    and nothing printed to the console.
+
+    Undo can also swap in fresh copies of the underlying .blend data, so
+    any object/bone references cached in `runtime` from before the undo
+    step may be stale. Invalidating the cached configuration signature
+    forces the next timer tick to call rebuild_runtime() and re-fetch
+    everything (armature, body, legs) from the settings by name.
+    """
+    runtime["configuration_signature"] = None
     sync_timer_with_settings()
 
 
@@ -2524,8 +2548,8 @@ class SPIDER_OT_reset_parameters(
         settings.max_step_time = 0.50
 
         # Advanced adaptive step distance
-        settings.speed_step_scale = 0.35
-        settings.max_speed_step_distance = 1.30
+        settings.speed_step_scale = 0.30
+        settings.max_speed_step_distance = 0.50
 
         # Bake range
         settings.bake_start = 1
@@ -3386,7 +3410,6 @@ class SPIDER_PT_walker(
         )
 
         # ====================================================
-        # ====================================================
         # SURFACE
         # ====================================================
 
@@ -3665,6 +3688,12 @@ def register():
     if _spider_walker_load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_spider_walker_load_post)
 
+    if _spider_walker_undo_post not in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.append(_spider_walker_undo_post)
+
+    if _spider_walker_undo_post not in bpy.app.handlers.redo_post:
+        bpy.app.handlers.redo_post.append(_spider_walker_undo_post)
+
     # Best-effort convenience defaults; never block registration on this.
     try:
         scene = bpy.context.scene
@@ -3685,6 +3714,12 @@ def register():
 def unregister():
     if _spider_walker_load_post in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_spider_walker_load_post)
+
+    if _spider_walker_undo_post in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.remove(_spider_walker_undo_post)
+
+    if _spider_walker_undo_post in bpy.app.handlers.redo_post:
+        bpy.app.handlers.redo_post.remove(_spider_walker_undo_post)
 
     stop_timer()
     runtime.clear()
