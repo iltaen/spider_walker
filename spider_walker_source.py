@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Spider Walker",
     "author": "iltaen",
-    "version": (1, 0, 5),
+    "version": (1, 0, 6),
     "blender": (5, 2, 0),
     "location": "Properties > Armature Data > Spider Walker",
     "description": (
@@ -307,6 +307,25 @@ def get_enabled_leg_names(
     return result
 
 
+def is_bone_descendant_of(bone, ancestor_name):
+    """True if `bone` (a PoseBone) has `ancestor_name` anywhere among its
+    parents. Used to reject leg controller bones that are (directly or
+    indirectly) children of the Center Bone -- such a bone would inherit
+    the Center Bone's motion twice: once through the armature's own bone
+    hierarchy, and once through this add-on repositioning it in world
+    space, producing incorrect / runaway leg placement."""
+    parent = bone.parent
+
+    while parent is not None:
+
+        if parent.name == ancestor_name:
+            return True
+
+        parent = parent.parent
+
+    return False
+
+
 def count_collision_meshes(collection):
     """Return the number of visible mesh objects in a collision collection."""
     if collection is None:
@@ -426,13 +445,21 @@ def validate_configuration(
 
     for name in leg_names:
 
-        if (
-            armature.pose.bones.get(name)
-            is None
-        ):
+        leg_bone = armature.pose.bones.get(name)
+
+        if leg_bone is None:
 
             raise RuntimeError(
                 f"Leg bone '{name}' not found"
+            )
+
+        if is_bone_descendant_of(leg_bone, body.name):
+
+            raise RuntimeError(
+                f"Leg bone '{name}' is a child of Center Bone "
+                f"'{body.name}' in the bone hierarchy. Leg controller "
+                f"bones must not be parented (directly or indirectly) to "
+                f"the Center Bone -- re-parent it as a sibling instead."
             )
 
     return (
@@ -2987,6 +3014,8 @@ class SPIDER_OT_add_selected(
 
         added = 0
 
+        skipped_children = []
+
         # --------------------------------------------------------
         # Add selected bones.
         # --------------------------------------------------------
@@ -3001,6 +3030,16 @@ class SPIDER_OT_add_selected(
 
             # Don't add duplicates.
             if name in existing:
+                continue
+
+            # Reject bones parented (directly or indirectly) to the
+            # Center Bone -- see is_bone_descendant_of() for why.
+            if (
+                body_name
+                and
+                is_bone_descendant_of(pose_bone, body_name)
+            ):
+                skipped_children.append(name)
                 continue
 
             item = settings.legs.add()
@@ -3018,10 +3057,26 @@ class SPIDER_OT_add_selected(
 
         runtime["configuration_signature"] = None
 
-        self.report(
-            {'INFO'},
-            f"Added {added} bone(s)"
-        )
+        if skipped_children:
+
+            # Report as a single WARNING so it isn't immediately
+            # overwritten in the status bar by a separate INFO report.
+            self.report(
+                {'WARNING'},
+                (
+                    f"Added {added} bone(s). Skipped "
+                    f"{len(skipped_children)} parented to the Center "
+                    f"Bone: {', '.join(skipped_children)} -- re-parent "
+                    f"them as siblings first."
+                )
+            )
+
+        else:
+
+            self.report(
+                {'INFO'},
+                f"Added {added} bone(s)"
+            )
 
         return {'FINISHED'}
 
