@@ -1,5 +1,7 @@
 # Spider Walker
 
+*Disclaimer: The add-on code was partially created and refactored using AI.*
+
 A Blender 5.2 add-on that procedurally animates the legs of multi-legged
 (spider-type) rigs in real time. Legs raycast down onto a surface, step in
 turn to keep up with the body, and predict the direction of travel so they
