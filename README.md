@@ -9,6 +9,9 @@ land ahead of the body instead of trailing behind it. A bake operator turns
 the live simulation into a regular keyframed Action when you're happy with
 the result.
 
+Demo Video:
+![Video Demo](https://img.youtube.com/vi/DC9AK7qGfyU/0.jpg)](https://www.youtube.com/watch?v=DC9AK7qGfyU)
+
 ## Features
 
 - Real-time procedural leg placement driven by the body's movement
